@@ -1,0 +1,169 @@
+diff --git a/sharkd.c b/sharkd.c
+index 10d904b..1ef2e6a 100644
+--- a/sharkd.c
++++ b/sharkd.c
+@@ -509,6 +509,47 @@ sharkd_load_cap_file(void)
+     return load_cap_file(&cfile, 0, 0);
+ }
+ 
++/* Unlike load_cap_file(), this retains the sequential reader and protocol
++ * state across calls. The caller guarantees an append-only, unchanged prefix
++ * and an exact count of fully committed packets. Rotation requires a new open.
++ * Do not run postseq_cleanup_all_protocols(): a subsequent segment may complete
++ * a reassembly belonging to a packet already exposed to the client. */
++int
++sharkd_live_read(uint32_t target)
++{
++    int err = 0;
++    char *err_info = NULL;
++    int64_t offset;
++    wtap_rec rec;
++    epan_dissect_t *edt;
++
++    if (target < cfile.count)
++        return EINVAL;
++    if (!cfile.provider.frames)
++        cfile.provider.frames = new_frame_data_sequence();
++
++    edt = epan_dissect_new(cfile.epan,
++            cfile.rfcode != NULL || cfile.dfcode != NULL || postdissectors_want_hfids(), false);
++    wtap_rec_init(&rec, 1514);
++    wtap_cleareof(cfile.provider.wth);
++    while (cfile.count < target) {
++        if (!wtap_read(cfile.provider.wth, &rec, &err, &err_info, &offset)) {
++            /* Unexpected EOF is NOT a successful commit. The session wrapper
++             * poisons this live session, since Wiretap may have consumed part
++             * of a record. Recovery is a fresh open, never a blind retry. */
++            if (!err)
++                err = WTAP_ERR_SHORT_READ;
++            break;
++        }
++        process_packet(&cfile, edt, offset, &rec);
++        wtap_rec_reset(&rec);
++    }
++    wtap_rec_cleanup(&rec);
++    epan_dissect_free(edt);
++    g_free(err_info);
++    return err;
++}
++
+ int
+ sharkd_load_cap_file_with_limits(int max_packet_count, int64_t max_byte_count)
+ {
+diff --git a/sharkd.h b/sharkd.h
+index e1ac889..f4b17c3 100644
+--- a/sharkd.h
++++ b/sharkd.h
+@@ -33,6 +33,9 @@ typedef void (*sharkd_dissect_func_t)(epan_dissect_t *edt, proto_tree *tree, str
+ /* sharkd.c */
+ cf_status_t sharkd_cf_open(const char *fname, unsigned int type, bool is_tempfile, int *err);
+ int sharkd_load_cap_file(void);
++/* Experimental append-only API. Counts are absolute committed packet counts,
++ * supplied by a framing-aware caller; never read a writer's incomplete tail. */
++int sharkd_live_read(uint32_t target);
+ int sharkd_load_cap_file_with_limits(int max_packet_count, int64_t max_byte_count);
+ int sharkd_retap(void);
+ int sharkd_filter(const char *dftext, uint8_t **result);
+diff --git a/sharkd_session.c b/sharkd_session.c
+index 4044de7..5251777 100644
+--- a/sharkd_session.c
++++ b/sharkd_session.c
+@@ -84,6 +84,8 @@ struct sharkd_filter_item
+ };
+ 
+ static GHashTable *filter_table;
++/* A failed append must not be retried on a possibly partially consumed reader. */
++static bool live_session;
+ 
+ static int mode;
+ static uint32_t rpcid;
+@@ -371,6 +373,9 @@ json_prep(char* buf, const jsmntok_t* tokens, int count)
+         {NULL,         "params",         1, JSMN_OBJECT,       SHARKD_JSON_OBJECT,   SHARKD_OPTIONAL},
+ 
+         // Valid methods
++        {"method", "live-capabilities", 1, JSMN_STRING, SHARKD_JSON_STRING, SHARKD_OPTIONAL},
++        {"method", "live-open", 1, JSMN_STRING, SHARKD_JSON_STRING, SHARKD_OPTIONAL},
++        {"method", "live-append", 1, JSMN_STRING, SHARKD_JSON_STRING, SHARKD_OPTIONAL},
+         {"method",     "analyse",        1, JSMN_STRING,       SHARKD_JSON_STRING,   SHARKD_OPTIONAL},
+         {"method",     "bye",            1, JSMN_STRING,       SHARKD_JSON_STRING,   SHARKD_OPTIONAL},
+         {"method",     "check",          1, JSMN_STRING,       SHARKD_JSON_STRING,   SHARKD_OPTIONAL},
+@@ -451,6 +456,11 @@ json_prep(char* buf, const jsmntok_t* tokens, int count)
+         {"iograph",    "aot8",           2, JSMN_PRIMITIVE,    SHARKD_JSON_BOOLEAN,  SHARKD_OPTIONAL},
+         {"iograph",    "aot9",           2, JSMN_PRIMITIVE,    SHARKD_JSON_BOOLEAN,  SHARKD_OPTIONAL},
+         {"load",       "file",           2, JSMN_STRING,       SHARKD_JSON_STRING,   SHARKD_MANDATORY},
++        {"live-open",  "file",           2, JSMN_STRING,       SHARKD_JSON_STRING, SHARKD_MANDATORY},
++        /* INTEGER allows zero here; ws_strtou32 in the handler rejects negatives.
++         * The generic UINTEGER validator instead requires strictly positive. */
++        {"live-open",  "packets",        2, JSMN_PRIMITIVE,    SHARKD_JSON_INTEGER, SHARKD_MANDATORY},
++        {"live-append","packets",        2, JSMN_PRIMITIVE,    SHARKD_JSON_INTEGER, SHARKD_MANDATORY},
+         {"load",       "max_packets",    2, JSMN_PRIMITIVE,    SHARKD_JSON_UINTEGER, SHARKD_OPTIONAL},
+         {"load",       "max_bytes",      2, JSMN_PRIMITIVE,    SHARKD_JSON_UINTEGER, SHARKD_OPTIONAL},
+         {"setcomment", "frame",          2, JSMN_PRIMITIVE,    SHARKD_JSON_UINTEGER, SHARKD_MANDATORY},
+@@ -1294,6 +1304,7 @@ sharkd_session_process_field(const char* buf, const jsmntok_t* tokens, int count
+ static void
+ sharkd_session_process_load(const char *buf, const jsmntok_t *tokens, int count)
+ {
++    live_session = false;
+     const char *tok_file = json_find_attr(buf, tokens, count, "file");
+     const char *tok_max_packets = json_find_attr(buf, tokens, count, "max_packets");
+     const char *tok_max_bytes = json_find_attr(buf, tokens, count, "max_bytes");
+@@ -6083,6 +6094,43 @@ sharkd_session_process_download(char *buf, const jsmntok_t *tokens, int count)
+     }
+ }
+ 
++/* Deliberately namespaced as new methods: stock load behavior is untouched.
++ * This is a protocol-v1 prototype, not an upstream compatibility promise. */
++static void
++sharkd_session_process_live(const char *buf, const jsmntok_t *tokens, int count, bool opening)
++{
++    uint32_t target;
++    int err = 0;
++    const char *value = json_find_attr(buf, tokens, count, "packets");
++    if (!value || !ws_strtou32(value, NULL, &target)) {
++        sharkd_json_error(rpcid, -32602, NULL, "Invalid committed packet count");
++        return;
++    }
++    if (opening) {
++        const char *file = json_find_attr(buf, tokens, count, "file");
++        live_session = false;
++        if (!file || sharkd_cf_open(file, WTAP_TYPE_AUTO, false, &err) != CF_OK) {
++            sharkd_json_error(rpcid, -2001, NULL, "Unable to open live file");
++            return;
++        }
++        live_session = true;
++    }
++    if (!live_session) {
++        sharkd_json_error(rpcid, -2002, NULL, "Live session must be reopened");
++        return;
++    }
++    /* Cached filter bitsets include old packets too. A new response can change
++     * fields on its earlier request, so invalidating only the suffix is wrong. */
++    g_hash_table_remove_all(filter_table);
++    err = sharkd_live_read(target);
++    if (err) {
++        live_session = false;
++        sharkd_json_error(rpcid, -2003, NULL, "Live read failed; reopen required");
++        return;
++    }
++    sharkd_json_simple_ok(rpcid);
++}
++
+ static void
+ sharkd_session_process(char *buf, const jsmntok_t *tokens, int count)
+ {
+@@ -6100,7 +6148,14 @@ sharkd_session_process(char *buf, const jsmntok_t *tokens, int count)
+                     "No method found");
+             return;
+         }
+-        if (!strcmp(tok_method, "load"))
++        if (!strcmp(tok_method, "live-capabilities")) {
++            sharkd_json_result_prologue(rpcid);
++            sharkd_json_value_anyf("append_protocol", "%d", 1);
++            sharkd_json_result_epilogue();
++        }
++        else if (!strcmp(tok_method, "live-open") || !strcmp(tok_method, "live-append"))
++            sharkd_session_process_live(buf, tokens, count, !strcmp(tok_method, "live-open"));
++        else if (!strcmp(tok_method, "load"))
+             sharkd_session_process_load(buf, tokens, count);
+         else if (!strcmp(tok_method, "status"))
+             sharkd_session_process_status();
